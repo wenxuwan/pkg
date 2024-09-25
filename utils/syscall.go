@@ -1,3 +1,5 @@
+// +build !windows
+
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -73,7 +75,8 @@ func setHijackFile(stdFiles []*os.File, newFilePath string) {
 		// rotate by day
 		for {
 			todayStr := time.Now().Format("2006-01-02")
-			time.Sleep(nextDayDuration())
+			// use system localtion
+			time.Sleep(nextDayDuration(time.Now(), time.Local))
 			rotate(todayStr)
 		}
 	}
@@ -81,9 +84,8 @@ func setHijackFile(stdFiles []*os.File, newFilePath string) {
 }
 
 // nextDayDuration returns the duration to next day
-func nextDayDuration() time.Duration {
-	now := time.Now()
-	today, _ := time.ParseInLocation("2006-01-02", now.Format("2006-01-02"), time.Local) // use system location
-	nextday := today.Add(24 * time.Hour)
+func nextDayDuration(now time.Time, local *time.Location) time.Duration {
+	today, _ := time.ParseInLocation("2006-01-02", now.Format("2006-01-02"), local)
+	nextday := today.AddDate(0, 0, 1)
 	return nextday.Sub(now)
 }

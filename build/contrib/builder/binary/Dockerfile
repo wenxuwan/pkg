@@ -1,1 +1,1 @@
-FROM golang:1.12.7
+FROM golang:1.18

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
@@ -31,10 +32,13 @@ import (
 var (
 	// defaultRoller is roller by one day
 	defaultRoller = Roller{MaxTime: defaultRotateTime, Handler: rollerHandler}
+	// globalNotifications are used to send notify when defaultRollter is updated
+	globalNotifications = make([]chan<- bool, 0, 8)
 
 	// lumberjacks maps log filenames to the logger
 	// that is being used to keep them rolled/maintained.
-	lumberjacks = make(map[string]*lumberjack.Logger)
+	lumberjacks       = make(map[string]*lumberjack.Logger)
+	lumberjacksLocker sync.Mutex
 
 	errInvalidRollerParameter = errors.New("invalid roller parameter")
 )
@@ -76,11 +80,9 @@ type Roller struct {
 type RollerHandler func(l *LoggerInfo)
 
 // GetLogWriter returns an io.Writer that writes to a rolling logger.
-// This should be called only from the main goroutine (like during
-// server setup) because this method is not thread-safe; it is careful
-// to create only one log writer per log file, even if the log file
-// is shared by different sites or middlewares. This ensures that
-// rolling is synchronized, since a process (or multiple processes)
+// it is careful to create only one log writer per log file, even if
+// the log file is shared by different sites or middlewares. This ensures
+// that rolling is synchronized, since a process (or multiple processes)
 // should not create more than one roller on the same file at the
 // same time. See issue #1363.
 func (l Roller) GetLogWriter() io.Writer {
@@ -88,20 +90,36 @@ func (l Roller) GetLogWriter() io.Writer {
 	if err != nil {
 		absPath = l.Filename // oh well, hopefully they're consistent in how they specify the filename
 	}
-	lj, has := lumberjacks[absPath]
-	if !has {
-		lj = &lumberjack.Logger{
-			Filename:   l.Filename,
-			MaxSize:    l.MaxSize,
-			MaxAge:     l.MaxAge,
-			MaxBackups: l.MaxBackups,
-			Compress:   l.Compress,
-			LocalTime:  l.LocalTime,
-		}
-		lumberjacks[absPath] = lj
-	}
 
+	lumberjacksLocker.Lock()
+	defer lumberjacksLocker.Unlock()
+	lj, has := lumberjacks[absPath]
+	if has {
+		return lj
+	}
+	lj = &lumberjack.Logger{
+		Filename:   l.Filename,
+		MaxSize:    l.MaxSize,
+		MaxAge:     l.MaxAge,
+		MaxBackups: l.MaxBackups,
+		Compress:   l.Compress,
+		LocalTime:  l.LocalTime,
+	}
+	lumberjacks[absPath] = lj
 	return lj
+}
+
+func registeNofify(ch chan bool) {
+	globalNotifications = append(globalNotifications, ch)
+}
+
+func sendNotify() {
+	for _, ch := range globalNotifications {
+		select {
+		case ch <- true:
+		default:
+		}
+	}
 }
 
 // InitDefaultRoller
@@ -111,6 +129,9 @@ func InitGlobalRoller(roller string) error {
 		return err
 	}
 	defaultRoller = *r
+
+	sendNotify()
+
 	return nil
 }
 
@@ -126,21 +147,35 @@ func DefaultRoller() *Roller {
 	}
 }
 
-func setLogFileFormat(l *LoggerInfo) {
-	if len(l.LogRoller.FileNameFormat) != 0 {
-		l.LogRoller.FileNameFormat = l.FilePath + l.LogRoller.FileNameFormat
-		return
-	}
-	if l.LogRoller.MaxTime == defaultRotateTime {
-		l.LogRoller.FileNameFormat = l.FileName + "." + "2006-01-02"
-	} else {
-		l.LogRoller.FileNameFormat = l.FileName + "." + "2006-01-02_15"
-	}
-}
 func rollerHandler(l *LoggerInfo) {
-	setLogFileFormat(l)
+	var filename string
+	// file roller
+	if l.LogRoller.MaxTime == defaultRotateTime {
+		filename = l.FileName + "." + l.CreateTime.Format("2006-01-02")
+	} else {
+		filename = l.FileName + "." + l.CreateTime.Format("2006-01-02_15")
+	}
+
+	name := filename
+	maxGeneration := defaultRotateKeep
+	if l.LogRoller.MaxBackups > 0 {
+		maxGeneration = l.LogRoller.MaxBackups
+	}
+	// if rollerFile exists, add a generational name
+	for generation := 0; generation <= maxGeneration; {
+		_, err := os.Stat(name)
+		// if os.Stat returns an error, maybe the file is not exists
+		// or have some permissions problems, try to write file
+		if err != nil {
+			filename = name
+
+			break
+		}
+		generation++
+		name = filename + "." + strconv.Itoa(generation)
+	}
 	// ignore the rename error, in case the l.output is deleted
-	os.Rename(l.FileName, l.CreateTime.Format(l.LogRoller.FileNameFormat))
+	_ = os.Rename(l.FileName, filename)
 }
 
 // ParseRoller parses roller contents out of c.

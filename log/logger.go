@@ -23,20 +23,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	gsyslog "github.com/hashicorp/go-syslog"
-	"mosn.io/pkg/buffer"
 	"mosn.io/pkg/utils"
 )
 
 var (
-	// localOffset is offset in seconds east of UTC
-	_, localOffset = time.Now().Zone()
 	// error
 	ErrReopenUnsupported = errors.New("reopen unsupported")
 
@@ -49,7 +45,7 @@ var (
 
 // Logger is a basic sync logger implement, contains unexported fields
 // The Logger Function contains:
-// Print(buffer buffer.IoBuffer, discard bool) error
+// Print(buffer LogBuffer, discard bool) error
 // Printf(format string, args ...interface{})
 // Println(args ...interface{})
 // Fatalf(format string, args ...interface{})
@@ -74,10 +70,11 @@ type Logger struct {
 	// implementation elements
 	create          time.Time
 	once            sync.Once
+	rollerUpdate    chan bool
 	stopRotate      chan struct{}
 	reopenChan      chan struct{}
 	closeChan       chan struct{}
-	writeBufferChan chan buffer.IoBuffer
+	writeBufferChan chan LogBuffer
 }
 
 type LoggerInfo struct {
@@ -131,13 +128,19 @@ func ClearAll() {
 	loggers = sync.Map{}
 }
 
+// defaultBufferSize indicates the amount that can be cached in a logger
+const defaultBufferSize = 500
+
 func GetOrCreateLogger(output string, roller *Roller) (*Logger, error) {
 	if lg, ok := loggers.Load(output); ok {
 		return lg.(*Logger), nil
 	}
 
+	notify := make(chan bool, 1)
 	if roller == nil {
 		roller = &defaultRoller
+		// use defaultRoller, add a notify
+		registeNofify(notify)
 	}
 
 	if roller.Handler == nil {
@@ -148,10 +151,11 @@ func GetOrCreateLogger(output string, roller *Roller) (*Logger, error) {
 		output:          output,
 		outputPath:      outputPath,
 		roller:          roller,
-		writeBufferChan: make(chan buffer.IoBuffer, 500),
+		writeBufferChan: make(chan LogBuffer, defaultBufferSize),
 		reopenChan:      make(chan struct{}),
 		closeChan:       make(chan struct{}),
 		stopRotate:      make(chan struct{}),
+		rollerUpdate:    notify,
 		// writer and create will be setted in start()
 	}
 	err := lg.start()
@@ -184,7 +188,7 @@ func (l *Logger) start() error {
 			if err := os.MkdirAll(filepath.Dir(l.output), 0755); err != nil {
 				return err
 			}
-			file, err := os.OpenFile(l.output, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+			file, err := os.OpenFile(l.output, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 			if err != nil {
 				return err
 			}
@@ -222,7 +226,6 @@ func (l *Logger) handler() {
 			go l.handler()
 		}
 	}()
-	var buf buffer.IoBuffer
 	for {
 		select {
 		case <-l.reopenChan:
@@ -231,36 +234,26 @@ func (l *Logger) handler() {
 			if err == nil {
 				return
 			}
-			fmt.Printf("%s reopen failed : %v\n", l.output, err)
+			fmt.Fprintf(os.Stderr, "%s reopen failed : %v\n", l.output, err)
 		case <-l.closeChan:
 			// flush all buffers before close
 			// make sure all logs are outputed
 			// a closed logger can not write anymore
 			for {
 				select {
-				case buf = <-l.writeBufferChan:
-					buf.WriteTo(l)
-					buffer.PutIoBuffer(buf)
+				case buf := <-l.writeBufferChan:
+					l.Write(buf.Bytes())
+					PutLogBuffer(buf)
 				default:
 					l.stop()
 					close(l.stopRotate)
 					return
 				}
 			}
-		case buf = <-l.writeBufferChan:
-			for i := 0; i < 20; i++ {
-				select {
-				case b := <-l.writeBufferChan:
-					buf.Write(b.Bytes())
-					buffer.PutIoBuffer(b)
-				default:
-					break
-				}
-			}
-			buf.WriteTo(l)
-			buffer.PutIoBuffer(buf)
+		case buf := <-l.writeBufferChan:
+			l.Write(buf.Bytes())
+			PutLogBuffer(buf)
 		}
-		runtime.Gosched()
 	}
 }
 
@@ -282,9 +275,10 @@ func (l *Logger) reopen() error {
 		return ErrReopenUnsupported
 	}
 	if closer, ok := l.writer.(io.WriteCloser); ok {
-		err := closer.Close()
-		if err != nil {
-			return err
+		// ignore the close error, always try to start a new file
+		// record the error info
+		if err := closer.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger %s close error when restart, error: %v", l.output, err)
 		}
 		return l.start()
 	}
@@ -295,10 +289,13 @@ var ErrChanFull = errors.New("channel is full")
 
 // Print writes the final buffere to the buffer chan
 // if discard is true and the buffer is full, returns an error
-func (l *Logger) Print(buf buffer.IoBuffer, discard bool) error {
+// If a LogBuffer needs to call Print N(N>1) times, the LogBuffer.Count(N-1) should be called
+// or call LogBuffer.Count(1) N-1 times.
+// If the N is 1, LogBuffer.Count should not be called.
+func (l *Logger) Print(buf LogBuffer, discard bool) error {
 	if l.disable {
 		// free the buf
-		buffer.PutIoBuffer(buf)
+		PutLogBuffer(buf)
 		return nil
 	}
 	select {
@@ -319,7 +316,7 @@ func (l *Logger) Println(args ...interface{}) {
 		return
 	}
 	s := fmt.Sprintln(args...)
-	buf := buffer.GetIoBuffer(len(s))
+	buf := GetLogBuffer(len(s))
 	buf.WriteString(s)
 	if len(s) == 0 || s[len(s)-1] != '\n' {
 		buf.WriteString("\n")
@@ -332,7 +329,7 @@ func (l *Logger) Printf(format string, args ...interface{}) {
 		return
 	}
 	s := fmt.Sprintf(format, args...)
-	buf := buffer.GetIoBuffer(len(s))
+	buf := GetLogBuffer(len(s))
 	buf.WriteString(s)
 	if len(s) == 0 || s[len(s)-1] != '\n' {
 		buf.WriteString("\n")
@@ -343,7 +340,7 @@ func (l *Logger) Printf(format string, args ...interface{}) {
 // Fatal cannot be disabled
 func (l *Logger) Fatalf(format string, args ...interface{}) {
 	s := fmt.Sprintf(format, args...)
-	buf := buffer.GetIoBuffer(len(s))
+	buf := GetLogBuffer(len(s))
 	buf.WriteString(s)
 	buf.WriteString("\n")
 	buf.WriteTo(l.writer)
@@ -352,7 +349,7 @@ func (l *Logger) Fatalf(format string, args ...interface{}) {
 
 func (l *Logger) Fatal(args ...interface{}) {
 	s := fmt.Sprint(args...)
-	buf := buffer.GetIoBuffer(len(s))
+	buf := GetLogBuffer(len(s))
 	buf.WriteString(s)
 	if len(s) == 0 || s[len(s)-1] != '\n' {
 		buf.WriteString("\n")
@@ -363,13 +360,19 @@ func (l *Logger) Fatal(args ...interface{}) {
 
 func (l *Logger) Fatalln(args ...interface{}) {
 	s := fmt.Sprintln(args...)
-	buf := buffer.GetIoBuffer(len(s))
+	buf := GetLogBuffer(len(s))
 	buf.WriteString(s)
 	if len(s) == 0 || s[len(s)-1] != '\n' {
 		buf.WriteString("\n")
 	}
 	buf.WriteTo(l.writer)
 	os.Exit(1)
+}
+
+func (l *Logger) calculateInterval(now time.Time) time.Duration {
+	// caculate the next time need to rotate
+	_, localOffset := now.Zone()
+	return time.Duration(l.roller.MaxTime-(now.Unix()+int64(localOffset))%l.roller.MaxTime) * time.Second
 }
 
 func (l *Logger) startRotate() {
@@ -384,8 +387,7 @@ func (l *Logger) startRotate() {
 		if now.Sub(l.create) > time.Duration(l.roller.MaxTime)*time.Second {
 			interval = 0
 		} else {
-			// caculate the next time need to rotate
-			interval = time.Duration(l.roller.MaxTime-(now.Unix()+int64(localOffset))%l.roller.MaxTime) * time.Second
+			interval = l.calculateInterval(now)
 		}
 		doRotate(l, interval)
 	}, func(r interface{}) {
@@ -396,11 +398,28 @@ func (l *Logger) startRotate() {
 var doRotate func(l *Logger, interval time.Duration) = doRotateFunc
 
 func doRotateFunc(l *Logger, interval time.Duration) {
+	timer := time.NewTimer(interval)
 	for {
 		select {
 		case <-l.stopRotate:
 			return
-		case <-time.After(interval):
+		case <-l.rollerUpdate:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
+			if defaultRoller.MaxTime > 0 {
+				now := time.Now()
+				interval = l.calculateInterval(now)
+			} else {
+				l.roller.Filename = l.output
+				l.writer = l.roller.GetLogWriter()
+				return
+			}
+		case <-timer.C:
 			now := time.Now()
 			info := LoggerInfo{FileName: l.output, FilePath: l.outputPath, CreateTime: l.create}
 			info.LogRoller = *l.roller
@@ -408,12 +427,13 @@ func doRotateFunc(l *Logger, interval time.Duration) {
 			l.create = now
 			go l.Reopen()
 
-			if interval == 0 { // recaculate interval
-				interval = time.Duration(l.roller.MaxTime-(now.Unix()+int64(localOffset))%l.roller.MaxTime) * time.Second
+			if interval == 0 { // recalculate interval
+				interval = l.calculateInterval(now)
 			} else {
 				interval = time.Duration(l.roller.MaxTime) * time.Second
 			}
 		}
+		timer.Reset(interval)
 	}
 }
 
